@@ -1,0 +1,198 @@
+name: PR SLA (solo test)
+
+# =====================================================================
+# SOLO TEST version — pre-filled for Rupeshdhiman61/pr-sla-test.
+# Lets you watch threading, once-per-level, "no reviewer yet", and
+# LEAD-ESCALATION pings hit YOURSELF, using only your own accounts.
+#
+# BEFORE COMMITTING, do TWO things:
+#   1. SLACK_CHANNEL_ID  -> your #pr-alerts channel id (see below).
+#   2. USER_MAP          -> map your GitHub login to your PERSONAL-workspace
+#                           Slack id (NOT your Adobe id).
+#
+# HOW TO GET YOUR PERSONAL SLACK ID:
+#   In the personal test workspace: click your avatar (top-right) -> Profile
+#   -> the "..." (More) menu -> "Copy member ID". It looks like U0ABC123.
+#
+# HOW TO GET THE CHANNEL ID:
+#   Right-click #pr-alerts -> View channel details -> scroll to bottom ->
+#   the Channel ID (like C0ABC123) is shown; click to copy.
+#
+# SECRETS to add in the repo (Settings > Secrets and variables > Actions):
+#   SLACK_BOT_TOKEN   = xoxb-...   (OAuth & Permissions page, after adding
+#                                   chat:write scope + Install to Workspace)
+#   (No GH_READ_TOKEN needed — you're watching the same repo it runs in.)
+#
+# ALSO: in Slack, invite the bot to the channel:  /invite @PR SLA Bot
+#
+# TEST THRESHOLDS: set to 0 so any open PR breaches immediately and you see
+# the parent message + lead cc right away. Real values are 4 and 12 (noted).
+# =====================================================================
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+env:
+  # ---- SLA thresholds ----  (TEST=0; real values: 4 and 12)
+  FIRST_REVIEW_SLA_HOURS: "0"
+  FIRST_REVIEW_WARN_HOURS: "0"
+  MERGE_SLA_HOURS: "0"
+  MERGE_WARN_HOURS: "0"
+
+  # ---- Scope: your test repo; empty assignees = match ALL PRs ----
+  WATCH_REPOS: "Rupeshdhiman61/pr-sla-test"
+  WATCH_ASSIGNEES: ""                       # empty = every PR counts (good for solo test)
+  REVIEWERS: ""                             # empty = any requested reviewer is eligible
+  ESCALATE_TO: "Rupeshdhiman61"             # cc'd on breach -> pings YOU (via USER_MAP)
+
+  # ---- Slack destination ----
+  SLACK_CHANNEL_ID: "C0C4E8P5QM6"          # <-- your #pr-alerts channel id
+
+  # ---- GitHub login -> Slack user id (so tags actually ping) ----
+  # Replace U_YOUR_PERSONAL_SLACK_ID with YOUR personal-workspace Slack id.
+  USER_MAP: '{"Rupeshdhiman61":"U0C3ETWN97F"}'
+
+permissions:
+  pull-requests: read
+  contents: read
+
+jobs:
+  sla:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Restore SLA state
+        uses: actions/cache@v4
+        with:
+          path: pr-sla-state.json
+          key: pr-sla-state-${{ github.run_id }}
+          restore-keys: |
+            pr-sla-state-
+
+      - name: Evaluate PRs and nag Slack (threaded, once-per-level)
+        uses: actions/github-script@v7
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+        with:
+          script: |
+            const fs = require('fs');
+            const HOUR = 3600000;
+            const now = Date.now();
+
+            const firstSla  = Number(process.env.FIRST_REVIEW_SLA_HOURS);
+            const firstWarn = Number(process.env.FIRST_REVIEW_WARN_HOURS);
+            const mergeSla  = Number(process.env.MERGE_SLA_HOURS);
+            const mergeWarn = Number(process.env.MERGE_WARN_HOURS);
+
+            const list = (s) => (s || "").split(",").map(x => x.trim()).filter(Boolean);
+            const watchRepos = list(process.env.WATCH_REPOS);
+            const watchAssignees = new Set(list(process.env.WATCH_ASSIGNEES));
+            const reviewersAllow = new Set(list(process.env.REVIEWERS));
+            const escalateTo = list(process.env.ESCALATE_TO);
+            const channel = process.env.SLACK_CHANNEL_ID;
+            let userMap = {}; try { userMap = JSON.parse(process.env.USER_MAP || "{}"); } catch {}
+
+            const hoursSince = (iso) => (now - new Date(iso).getTime()) / HOUR;
+            const fmt = (h) => h.toFixed(1);
+            const tag = (login) => userMap[login] ? `<@${userMap[login]}>` : `@${login}`;
+
+            async function slack(method, payload) {
+              const res = await fetch(`https://slack.com/api/${method}`, {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json; charset=utf-8",
+                  "Authorization": `Bearer ${process.env.SLACK_BOT_TOKEN}`,
+                },
+                body: JSON.stringify(payload),
+              });
+              const data = await res.json();
+              if (!data.ok) core.warning(`Slack ${method} failed: ${data.error}`);
+              return data;
+            }
+            async function postParent(text) {
+              const d = await slack("chat.postMessage", { channel, text });
+              return d.ok ? d.ts : null;
+            }
+            async function reply(ts, text, broadcast) {
+              await slack("chat.postMessage", { channel, thread_ts: ts, text, reply_broadcast: !!broadcast });
+            }
+
+            let state = {};
+            try { state = JSON.parse(fs.readFileSync("pr-sla-state.json", "utf8")); } catch {}
+
+            for (const full of watchRepos) {
+              const [owner, repo] = full.split("/");
+              if (!owner || !repo) continue;
+
+              let prs = [];
+              try {
+                prs = await github.paginate(github.rest.pulls.list, {
+                  owner, repo, state: "open", per_page: 100,
+                });
+              } catch (e) { core.warning(`list ${full}: ${e.message}`); continue; }
+
+              for (const pr of prs) {
+                if (pr.draft) continue;
+
+                const people = [pr.user?.login, ...(pr.assignees || []).map(a => a.login)].filter(Boolean);
+                if (watchAssignees.size && !people.some(p => watchAssignees.has(p))) continue;
+
+                const key = `${full}#${pr.number}`;
+                const ageH = hoursSince(pr.created_at);
+
+                const requested = (pr.requested_reviewers || []).map(r => r.login);
+                const eligible = reviewersAllow.size
+                  ? requested.filter(r => reviewersAllow.has(r))
+                  : requested;
+                const reviewerText = eligible.length
+                  ? `reviewer: ${eligible.map(tag).join(", ")}`
+                  : `*no reviewer yet*`;
+
+                let reviews = [];
+                try {
+                  reviews = await github.paginate(github.rest.pulls.listReviews, {
+                    owner, repo, pull_number: pr.number, per_page: 100,
+                  });
+                } catch (e) { core.warning(`reviews ${key}: ${e.message}`); }
+                const hasReview = reviews.some(r => r.user && r.user.type !== "Bot");
+
+                let level = "ok", detail = "";
+                if (!hasReview && ageH >= firstSla) {
+                  level = "review-breach"; detail = `open ${fmt(ageH)}h, no review (target ${firstSla}h)`;
+                } else if (ageH >= mergeSla) {
+                  level = "merge-breach"; detail = `open ${fmt(ageH)}h, not merged (target ${mergeSla}h)`;
+                } else if (!hasReview && ageH >= firstWarn) {
+                  level = "review-warn"; detail = `open ${fmt(ageH)}h, no review (target ${firstSla}h)`;
+                } else if (ageH >= mergeWarn) {
+                  level = "merge-warn"; detail = `open ${fmt(ageH)}h, not merged (target ${mergeSla}h)`;
+                }
+
+                const prev = state[key] || { ts: null, level: "ok" };
+                if (level === prev.level) continue;   // only on CHANGE (no re-spam)
+
+                const emoji = level.endsWith("breach") ? "🔴"
+                            : level.endsWith("warn")   ? "🟠"
+                            : "✅";
+                const header = `${emoji} <${pr.html_url}|${full}#${pr.number}> — ${pr.title}`;
+                const meta = `author: ${tag(pr.user.login)} · ${reviewerText}`;
+                const cc = level.endsWith("breach") && escalateTo.length
+                  ? `\ncc ${escalateTo.map(tag).join(" ")} — please help unblock.` : "";
+
+                if (!prev.ts) {
+                  // First alert on this PR -> create thread parent (with cc if already breached).
+                  const ts = await postParent(`${header}\n${meta}\n${detail}${cc}`);
+                  state[key] = { ts, level };
+                } else {
+                  // PR already has a thread -> reply inside it.
+                  const body = (level === "ok")
+                    ? `✅ Resolved — ${detail || "back within SLA / reviewed"}.`
+                    : `${emoji} ${detail}\n${meta}${cc}`;
+                  await reply(prev.ts, body, level.endsWith("breach"));
+                  state[key] = { ts: prev.ts, level };
+                }
+              }
+            }
+
+            fs.writeFileSync("pr-sla-state.json", JSON.stringify(state));
+            core.info("SLA sweep complete.");
