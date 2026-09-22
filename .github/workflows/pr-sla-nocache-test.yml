@@ -1,0 +1,94 @@
+name: PR SLA (no-cache test)
+
+# NO-CACHE TEST: always evaluates and posts on every run (no state, no
+# "once-per-level" memory, no threading across runs). Use this ONLY to
+# confirm Slack posting + tagging works. Guaranteed message each run.
+#
+# EDIT before commit:
+#   SLACK_CHANNEL_ID -> your #pr-alerts channel id (C...)
+#   USER_MAP         -> your GitHub login -> your PERSONAL Slack id (U...)
+# SECRET: SLACK_BOT_TOKEN = xoxb-...   (bot needs chat:write; /invite the bot)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/30 * * * *"
+
+env:
+  FIRST_REVIEW_SLA_HOURS: "0"
+  MERGE_SLA_HOURS: "0"
+  WATCH_REPOS: "Rupeshdhiman61/pr-sla-test"
+  WATCH_ASSIGNEES: ""
+  REVIEWERS: ""
+  ESCALATE_TO: "Rupeshdhiman61"
+  SLACK_CHANNEL_ID: "C0C4E8P5QM6"
+  USER_MAP: '{"Rupeshdhiman61":"U0C3ETWN97F"}'
+
+permissions:
+  pull-requests: read
+  contents: read
+
+jobs:
+  sla:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+        with:
+          script: |
+            const HOUR = 3600000, now = Date.now();
+            const firstSla = Number(process.env.FIRST_REVIEW_SLA_HOURS);
+            const mergeSla = Number(process.env.MERGE_SLA_HOURS);
+            const list = (s) => (s||"").split(",").map(x=>x.trim()).filter(Boolean);
+            const watchRepos = list(process.env.WATCH_REPOS);
+            const watchAssignees = new Set(list(process.env.WATCH_ASSIGNEES));
+            const reviewersAllow = new Set(list(process.env.REVIEWERS));
+            const escalateTo = list(process.env.ESCALATE_TO);
+            const channel = process.env.SLACK_CHANNEL_ID;
+            let userMap = {}; try { userMap = JSON.parse(process.env.USER_MAP||"{}"); } catch {}
+            const fmt = (h)=>h.toFixed(1);
+            const tag = (l)=> userMap[l] ? `<@${userMap[l]}>` : `@${l}`;
+            const hoursSince = (iso)=>(now-new Date(iso).getTime())/HOUR;
+
+            async function slack(text){
+              const res = await fetch("https://slack.com/api/chat.postMessage",{
+                method:"POST",
+                headers:{"Content-Type":"application/json; charset=utf-8","Authorization":`Bearer ${process.env.SLACK_BOT_TOKEN}`},
+                body: JSON.stringify({channel, text}),
+              });
+              const d = await res.json();
+              if(!d.ok) core.warning(`Slack failed: ${d.error}`);
+              else core.info(`Posted to Slack (ts ${d.ts}).`);
+              return d;
+            }
+
+            let posted = 0;
+            for (const full of watchRepos){
+              const [owner,repo] = full.split("/");
+              if(!owner||!repo) continue;
+              const prs = await github.paginate(github.rest.pulls.list,{owner,repo,state:"open",per_page:100});
+              for (const pr of prs){
+                if(pr.draft) continue;
+                const people=[pr.user?.login,...(pr.assignees||[]).map(a=>a.login)].filter(Boolean);
+                if(watchAssignees.size && !people.some(p=>watchAssignees.has(p))) continue;
+
+                const ageH = hoursSince(pr.created_at);
+                const requested=(pr.requested_reviewers||[]).map(r=>r.login);
+                const eligible = reviewersAllow.size ? requested.filter(r=>reviewersAllow.has(r)) : requested;
+                const reviewerText = eligible.length ? `reviewer: ${eligible.map(tag).join(", ")}` : `*no reviewer yet*`;
+
+                const reviews = await github.paginate(github.rest.pulls.listReviews,{owner,repo,pull_number:pr.number,per_page:100});
+                const hasReview = reviews.some(r=>r.user && r.user.type!=="Bot");
+
+                let level="ok", detail="";
+                if(!hasReview && ageH>=firstSla){ level="review-breach"; detail=`open ${fmt(ageH)}h, no review (target ${firstSla}h)`; }
+                else if(ageH>=mergeSla){ level="merge-breach"; detail=`open ${fmt(ageH)}h, not merged (target ${mergeSla}h)`; }
+                if(level==="ok") continue;
+
+                const cc = escalateTo.length ? `\ncc ${escalateTo.map(tag).join(" ")} — please help unblock.` : "";
+                await slack(`🔴 <${pr.html_url}|${full}#${pr.number}> — ${pr.title}\nauthor: ${tag(pr.user.login)} · ${reviewerText}\n${detail}${cc}`);
+                posted++;
+              }
+            }
+            core.info(`Done. Messages posted: ${posted}.`);
